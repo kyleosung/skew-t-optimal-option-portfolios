@@ -12,10 +12,10 @@ Our second contribution is the numerical representation of portfolio weights, ob
 The effect of skewness on the portfolio weights is quantified by comparing our optimal skew t weights with those generated in the Student t setting. 
 We also find that, as expected, a better VaR approximation risk measure yields optimal portfolio weights which are more different than the variance optimal weights. 
 
-**Authors:** Kyle Sung and Traian A. Pirvu
+**Authors:** Kyle Sung and Traian A. Pirvu  
 **Institution:** Department of Mathematics and Statistics, McMaster University, Hamilton, ON, Canada  
-**Correspondence To:** Kyle Sung, sungk5@mcmaster.ca
-**Paper Link:** https://arxiv.org/abs/2601.07991
+**Correspondence To:** Kyle Sung, sungk5@mcmaster.ca  
+**Paper Link:** https://arxiv.org/abs/2601.07991  
 
 **Keywords:** Options, Optimal Portfolios, Value at Risk, Skew-Elliptical t Returns
 

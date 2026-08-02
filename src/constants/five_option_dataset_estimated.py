@@ -17,13 +17,13 @@ Parameters
     Student t parameters estimated via R (``sn::mst.mple`` with
     ``alpha`` fixed to zero), fit to GARCH-filtered daily log returns
     (750 observations, 2002-07-02 to 2005-08-04).  Loaded from
-    ``experiment_t_vs_skew_t_estimation/estimation_results/t_fit.json``.
+    ``estimation/estimation_results/t_fit.json``.
 
 ``AC_SKEW_t_*``
     Azzalini-Capitanio (AC) skew-t parameters estimated via R
     (``sn::mst.mple``), fit to the same GARCH-filtered residuals.
     Loaded from
-    ``experiment_t_vs_skew_t_estimation/estimation_results/ac_fit.json``.
+    ``estimation/estimation_results/ac_fit.json``.
 
 These are separate from the Hu and Kercheval (2010) constants in
 ``five_option_dataset.py``.  Small differences from HK are expected
@@ -31,8 +31,8 @@ because the data source is Yahoo Finance (with auto_adjust) rather
 than CRSP.
 
 To regenerate parameters, run:
-    PYTHONPATH=$(pwd) python experiment_t_vs_skew_t_estimation/estimate_skew_t.py
-    PYTHONPATH=$(pwd) python experiment_t_vs_skew_t_estimation/estimate_standard_t.py
+    PYTHONPATH=$(pwd) python estimation/estimate_skew_t.py
+    PYTHONPATH=$(pwd) python estimation/estimate_standard_t.py
 """
 
 import json
@@ -43,7 +43,7 @@ import numpy as np
 from src.constants.five_option_dataset import DAILY_VOL, TRADING_DAYS_PER_YEAR
 
 _RESULTS_DIR = Path(__file__).resolve().parent.parent.parent / (
-    "experiment_t_vs_skew_t_estimation/estimation_results"
+    "estimation/estimation_results"
 )
 
 # Daily diagonal scale matrix (shared by all sections below)
@@ -51,7 +51,7 @@ _D_daily = np.diag(DAILY_VOL)
 
 # =====================================================================
 # Student t estimated parameters (R/SN ``sn::mst.mple``, alpha=0)
-# Source: experiment_t_vs_skew_t_estimation/estimation_results/t_fit.json
+# Source: estimation/estimation_results/t_fit.json
 # =====================================================================
 
 with open(_RESULTS_DIR / "t_fit.json", "r") as _f:
@@ -80,7 +80,7 @@ EST_t_COV_ANNUAL = EST_t_COV_DAILY * TRADING_DAYS_PER_YEAR
 
 # =====================================================================
 # AC skew-t parameters from R/SN package (``sn::mst.mple``)
-# Source: experiment_t_vs_skew_t_estimation/estimation_results/skew_t_ac_fit.json
+# Source: estimation/estimation_results/skew_t_ac_fit.json
 #
 # The Azzalini-Capitanio (AC) skew-t is parameterised in direct (DP)
 # form as  Y ~ ST(xi, Omega, alpha, nu):

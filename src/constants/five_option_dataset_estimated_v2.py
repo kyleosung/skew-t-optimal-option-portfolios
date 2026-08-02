@@ -45,7 +45,7 @@ and live in ``estimation_results/``.
 Do not overwrite those files from ``compare_garch_innovations.py``.
 
 To regenerate parameters for all distributions, run:
-    PYTHONPATH=$(pwd) python experiment_t_vs_skew_t_estimation/compare_garch_innovations.py
+    PYTHONPATH=$(pwd) python estimation/compare_garch_innovations.py
 """
 
 import json
@@ -57,7 +57,7 @@ import numpy as np
 from src.constants.five_option_dataset import DAILY_VOL, TRADING_DAYS_PER_YEAR
 
 _RESULTS_DIR = Path(__file__).resolve().parent.parent.parent / (
-    "experiment_t_vs_skew_t_estimation/comparison_results"
+    "estimation/comparison_results"
 )
 
 # Daily diagonal scale matrix (shared by all sections below)
