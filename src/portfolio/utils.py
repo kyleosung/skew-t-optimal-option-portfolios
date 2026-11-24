@@ -56,13 +56,13 @@ def weights_to_number_of_shares(
 
 def build_scale_matrix(
     time_period_for_risk_measurements: float,
-    correlation: float | np.ndarray,
+    correlation: np.ndarray,
     volatilities: np.ndarray,
     spot_prices: np.ndarray,
 ) -> np.ndarray:
     """
     Build the scale matrix for asset *price changes* \\Delta S under
-    multivariable Student t-distribution.
+    multivariable Student's t-distribution.
 
     For a t-distribution with degrees of freedom \\nu, the covariance of \\Delta S is
     ``Cov[\\Delta S] = \\nu/(\\nu-2) \\times \\Sigma`` where \\Sigma is the scale matrix returned here.
@@ -83,9 +83,8 @@ def build_scale_matrix(
     time_period_for_risk_measurements : float
         Time period for risk measurements in years (e.g. ``1/252`` for one
         trading day).
-    correlation : float | np.ndarray
-        Pairwise correlation coefficient (float for uniform off-diagonal)
-        or full (n \\times n) correlation matrix.
+    correlation : np.ndarray
+        Full (n \\times n) correlation matrix.
     volatilities : np.ndarray
         Annualized GARCH unconditional volatilities of the underlying assets.
     spot_prices : np.ndarray
@@ -100,23 +99,10 @@ def build_scale_matrix(
     volatilities_diag = np.diag(volatilities)
     spot_prices_diag_matrix = np.diag(spot_prices)
 
-    n = len(volatilities)
-
-    if isinstance(correlation, np.ndarray) and correlation.shape != (n, n):
-        raise ValueError(
-            "If passing a matrix: correlation matrix must be of shape (n, n)."
-        )
-
-    if isinstance(correlation, float):
-        correlation_matrix = np.full((n, n), correlation)
-        np.fill_diagonal(correlation_matrix, 1.0)
-    else:
-        correlation_matrix = correlation
-
     scale_matrix = time_period_for_risk_measurements * (
         spot_prices_diag_matrix
         @ volatilities_diag
-        @ correlation_matrix
+        @ correlation
         @ volatilities_diag
         @ spot_prices_diag_matrix
     )

@@ -4,20 +4,19 @@ This repository contains the code for reproducing the results presented in the p
 
 ## Overview
 
-This paper explores option portfolio optimization when the underlying returns are skew-elliptical t-distributed. 
-We use the variance and value at risk (VaR) to measure portfolio risk. 
-The novelty of our work is the departure from the traditional normal returns setting, allowing investors to capture both heavy-tailed and skewed market dynamics. 
-We provide explicit portfolio weights for the variance and VaR approximation. 
-Our second contribution is the numerical representation of portfolio weights, obtained from numerical optimization for better VaR approximations. 
-The effect of skewness on the portfolio weights is quantified by comparing our optimal skew t weights with those generated in the Student t setting. 
-We also find that, as expected, a better VaR approximation risk measure yields optimal portfolio weights which are more different than the variance optimal weights. 
+This paper explores optimal option portfolio allocation when the underlying asset returns follow a skew-t distribution. 
+Portfolio risk is assessed using three criteria: variance, mean-volatility (CFVaR2), and mean-volatility-skewness (CFVaR3) risk measures. 
+The framework accommodates both heavy tails and asymmetry in financial markets. 
+We derive closed-form expressions for the mean, variance, and third central moment of the portfolio gain, together with explicit optimal portfolios under the variance and mean-volatility measures; the mean-volatility-skewness problem is solved numerically. 
+The effect of skewness on the optimal allocations is examined by comparing them with those obtained under Student's t-distributed returns. 
+The methodology is illustrated with European call and put options.
 
 **Authors:** Kyle Sung and Traian A. Pirvu  
 **Institution:** Department of Mathematics and Statistics, McMaster University, Hamilton, ON, Canada  
 **Correspondence To:** Kyle Sung, sungk5@mcmaster.ca  
 **Paper Link:** https://arxiv.org/abs/2601.07991  
 
-**Keywords:** Options, Optimal Portfolios, Value at Risk, Skew-Elliptical t Returns
+**Keywords:** Options, Portfolio Optimization, Skew-t Returns
 
 ## Citation
 
@@ -48,6 +47,7 @@ Sung, Kyle, and Traian A. Pirvu. "Optimal Option Portfolios for Skew-Elliptical 
 ### Prerequisites
 
 - Python 3.11.5 (or compatible version)
+- R with the `sn` and `jsonlite` packages, and `Rscript` on the PATH (the skew-t and Student's t distributions are fitted with `mst.mple` of `sn`)
 
 ### Installation
 

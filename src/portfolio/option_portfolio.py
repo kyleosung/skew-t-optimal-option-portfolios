@@ -4,7 +4,7 @@ Option portfolio.
 Portfolio optimization class for European options under the multivariate
 skew-t distribution \Delta S ~ t_N^skew(\mu, \Sigma, \omega, \nu).
 
-Setting \omega = 0 recovers the standard multivariate Student t-distribution as
+Setting \omega = 0 recovers the standard multivariate Student's t-distribution as
 a special case; all formulas below reduce to the standard-t results in that
 limit.
 
@@ -57,24 +57,22 @@ the combined sensitivity vector \alpha = \Gamma\mu + \delta.
 """
 
 from functools import cached_property
-from typing import Optional, Tuple, Union
+from typing import Tuple
 
 import numpy as np
 from scipy.optimize import minimize
 from scipy.special import gammaln
 from scipy.stats import norm
 
-from src.constants.numerics import (
-    NUM_RANDOM_STARTS,
-    OPTIMIZATION_ABS_THRESHOLD,
-    OPTIMIZATION_FTOL,
-    OPTIMIZATION_MAXITER,
-)
-from src.options.european_call import EuropeanCall
-from src.options.european_put import EuropeanPut
-from src.options.option import Underlying
+from src.options.european_option import EuropeanOption, Underlying
 from src.portfolio.utils import number_of_shares_to_weights, weights_to_number_of_shares
-from src.utils.linalg import invert_matrix_with_regularization
+
+# Tolerance on the discriminant of the CFVaR2 problem, below which a negative value
+# caused by round-off is set to zero
+OPTIMIZATION_ABS_THRESHOLD = 1e-12
+# Tolerance on the objective and iteration limit of the SLSQP optimization
+OPTIMIZATION_FTOL = 1e-12
+OPTIMIZATION_MAXITER = 1000
 
 
 class OptionPortfolio:
@@ -82,19 +80,19 @@ class OptionPortfolio:
     Unified portfolio class for European options under the skew-t distribution.
 
     Assumes \Delta S ~ t_N^skew(\mu, \Sigma, \omega, \nu).  Setting
-    omega = 0 recovers the standard multivariate Student t-distribution,
+    omega = 0 recovers the standard multivariate Student's t-distribution,
     so every property and optimization method works for both settings.
     """
 
     def __init__(
         self,
         underlyings: list[Underlying],
-        options: list[EuropeanCall | EuropeanPut],
+        options: list[EuropeanOption],
         time_period_for_risk_measurements: float,
         scale_matrix: np.ndarray,
-        omega: Optional[np.ndarray] = None,
-        degrees_of_freedom: float = 5.0,
-        returns: Optional[np.ndarray] = None,
+        omega: np.ndarray,
+        degrees_of_freedom: float,
+        returns: np.ndarray,
     ) -> None:
         r"""
         Initialize the unified option portfolio.
@@ -103,7 +101,7 @@ class OptionPortfolio:
         ----------
         underlyings : list[Underlying]
             The list of underlying assets for the options in the portfolio.
-        options : list[EuropeanCall | EuropeanPut]
+        options : list[EuropeanOption]
             The list of options to include in the portfolio.
         time_period_for_risk_measurements : float
             The time period \Delta t for risk measurements.
@@ -111,17 +109,15 @@ class OptionPortfolio:
             The scale matrix \Sigma of the skew-t distribution (N by N).
             For the skew-t with \nu degrees of freedom:
             Cov[\Delta S] = \nu/(\nu-2) \Sigma (in the symmetric case).
-        omega : Optional[np.ndarray], optional
-            The skewness parameter vector \omega (N-dimensional).
-            When omega = 0 (default), the distribution reduces to the
-            standard multivariate Student t.
-        degrees_of_freedom : float, optional
-            The degrees of freedom \nu, default 5.
+        omega : np.ndarray
+            The skewness parameter vector \omega (N-dimensional); zero for the
+            standard multivariate Student's t.
+        degrees_of_freedom : float
+            The degrees of freedom \nu.
             Must be > 4 for second moments to exist and > 6 for CFVaR3.
-        returns : Optional[np.ndarray], optional
-            The ANNUALIZED expected log returns for the underlying assets.
+        returns : np.ndarray
+            The ANNUALIZED expected arithmetic returns for the underlying assets.
             Converted to absolute price drift: \mu = S * returns * \Delta t.
-            Defaults to zero (no drift).
         """
         self.underlyings = underlyings
 
@@ -152,15 +148,12 @@ class OptionPortfolio:
             [option.theta for option in self.options], dtype=float
         ).reshape(-1, 1)
 
-        if returns is None:
-            self.mu = np.zeros((self.N, 1))  # zero drift returns
-        else:
-            # mu represents the expected absolute price change E[\Delta S]
-            # where \Delta S ~ t_N(mu, \Sigma, \nu) is the change in stock prices
-            # For t-distributed returns: E[\Delta S] \approx S * r * \Delta t
-            # where S is the spot price, r is the expected log return, and \Delta t is time period
-            returns_reshaped = np.asarray(returns, dtype=float).reshape(-1, 1)
-            self.mu = spot_prices * returns_reshaped * time_period_for_risk_measurements
+        # mu represents the expected absolute price change E[\Delta S]
+        # where \Delta S ~ t_N(mu, \Sigma, \nu) is the change in stock prices
+        # For t-distributed returns: E[\Delta S] \approx S * r * \Delta t
+        # where S is the spot price, r is the expected arithmetic return, and \Delta t is time period
+        returns_reshaped = np.asarray(returns, dtype=float).reshape(-1, 1)
+        self.mu = spot_prices * returns_reshaped * time_period_for_risk_measurements
 
         self.time_period_for_risk_measurements = time_period_for_risk_measurements
         self.scale_matrix = np.asarray(scale_matrix, dtype=float)
@@ -172,41 +165,7 @@ class OptionPortfolio:
         self.degrees_of_freedom = degrees_of_freedom
 
         # Skewness parameter omega (N by 1). Zero vector -> standard t.
-        if omega is None:
-            self.omega = np.zeros((self.N, 1))
-        else:
-            omega_array = np.asarray(omega, dtype=float)
-            if omega_array.ndim == 0:
-                self.omega = np.full((self.N, 1), float(omega_array))
-            else:
-                omega_array = omega_array.reshape(-1)
-                if omega_array.size != self.N:
-                    raise ValueError(
-                        f"omega must have shape ({self.N},) or ({self.N}, 1); "
-                        f"got {np.asarray(omega).shape}."
-                    )
-                self.omega = omega_array.reshape(-1, 1)
-
-    def delta_vector(self, shares_vector: np.ndarray) -> np.ndarray:
-        """
-        Compute the portfolio delta vector showing total portfolio sensitivity to each underlying.
-
-        The delta vector is an N-dimensional vector where element n represents:
-        d(V)/d(S_n) - the total portfolio sensitivity to underlying asset n.
-
-        This is computed as the sum of all option sensitivities to each underlying.
-        When used in portfolio optimization with a shares vector, the portfolio
-        delta becomes: portfolio_delta = delta_matrix.T @ shares_vector, where
-        shares_vector contains the number of shares for each option.
-
-        Returns
-        -------
-        np.ndarray
-            N-dimensional delta vector where N is the number of underlyings,
-            representing the sum of deltas for all options on each underlying
-        """
-        delta_vec = self.D @ shares_vector
-        return delta_vec.reshape(-1, 1)
+        self.omega = np.asarray(omega, dtype=float).reshape(-1, 1)
 
     def get_expected_portfolio_gain(self, shares_vector: np.ndarray) -> float:
         r"""
@@ -227,22 +186,6 @@ class OptionPortfolio:
         Uses the unified expected gain vector **u** (= \zeta when \omega = 0).
         """
         return (self.u.T @ shares_vector).item()
-
-    def get_expected_portfolio_loss(self, shares_vector: np.ndarray) -> float:
-        """
-        Get the expected portfolio loss for a given shares vector.
-
-        Parameters
-        ----------
-        shares_vector : np.ndarray
-            The vector of number of shares of the options in the portfolio.
-
-        Returns
-        -------
-        float
-            The expected portfolio loss
-        """
-        return -self.get_expected_portfolio_gain(shares_vector)
 
     def get_variance_portfolio_loss(self, shares_vector: np.ndarray) -> float:
         r"""
@@ -314,69 +257,6 @@ class OptionPortfolio:
 
         return cfvar2 + term3
 
-    def get_CFES2_portfolio_loss(
-        self, shares_vector: np.ndarray, alpha: float
-    ) -> float:
-        """
-        Get the CFES2 (Cornish-Fisher Expected Shortfall, 2nd order) of the portfolio loss.
-
-        Parameters
-        ----------
-        shares_vector : np.ndarray
-            The vector of number of shares of the options in the portfolio.
-        alpha : float
-            The tail risk (alpha) for the CFES2 calculation.
-
-        Returns
-        -------
-        float
-            The CFES2 of the portfolio loss
-
-        Formula
-        -------
-        CFES_2^alpha = -zeta^T x + phi(Phi^{-1}(alpha)) / alpha * sqrt(0.5 * x^T U x)
-        """
-        z_alpha = norm.ppf(alpha)
-        phi_z = norm.pdf(z_alpha)
-        return -self.get_expected_portfolio_gain(shares_vector) + (
-            phi_z / alpha
-        ) * np.sqrt(self.get_variance_portfolio_loss(shares_vector))
-
-    def get_CFES3_portfolio_loss(
-        self, shares_vector: np.ndarray, alpha: float
-    ) -> float:
-        """
-        Get the CFES3 (Cornish-Fisher Expected Shortfall, 3rd order) of the portfolio loss.
-
-        Parameters
-        ----------
-        shares_vector : np.ndarray
-            The vector of number of shares of the options in the portfolio.
-        alpha : float
-            The tail risk (alpha) for the CFES3 calculation.
-
-        Returns
-        -------
-        float
-            The CFES3 of the portfolio loss
-
-        Formula
-        -------
-        CFES_3^alpha = CFES_2^alpha
-            + (1/6) * (Phi^{-1}(alpha) * phi(Phi^{-1}(alpha)) / alpha)
-              * kappa_3(x) / (0.5 * x^T U x)
-        """
-        cfes2 = self.get_CFES2_portfolio_loss(shares_vector, alpha)
-
-        z_alpha = norm.ppf(alpha)
-        phi_z = norm.pdf(z_alpha)
-        kappa3 = self.kappa_third_moment(shares_vector)
-        variance = self.get_variance_portfolio_loss(shares_vector)
-
-        term3 = (1 / 6) * (z_alpha * phi_z / alpha) * kappa3 / variance
-
-        return (cfes2 + term3).item()
-
     def get_optimal_variance_weights_lagrange(self) -> Tuple[np.ndarray, np.ndarray]:
         """
         Get the optimal variance number of shares and weights for
@@ -439,324 +319,27 @@ class OptionPortfolio:
 
         return x, w
 
-    def get_optimal_CFES2_weights_lagrange(
-        self, alpha: float
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Get the optimal CFES2 number of shares and weights for
-        the portfolio using the analytical Lagrange multiplier solution.
-
-        Parameters
-        ----------
-        alpha : float
-            The tail risk for the CFES2 calculation.
-
-        Returns
-        -------
-        Tuple[np.ndarray, np.ndarray]
-            - The optimal number of shares for the portfolio
-            - The optimal weights vector scaled by the option values
-        """
-        A_cal_ES = self.A_cal_ES(alpha)
-        B_cal_ES = self.B_cal_ES(alpha)
-        C_cal_ES = self.C_cal_ES(alpha)
-
-        discriminant = B_cal_ES**2 - 4 * A_cal_ES * C_cal_ES
-
-        if discriminant < 0 and abs(discriminant) < OPTIMIZATION_ABS_THRESHOLD:
-            discriminant = 0.0
-
-        epsilon_plus = (-B_cal_ES + np.sqrt(discriminant)) / (2 * A_cal_ES)
-        epsilon_minus = (-B_cal_ES - np.sqrt(discriminant)) / (2 * A_cal_ES)
-
-        psi_plus = self.psi(epsilon_plus.item())
-        psi_minus = self.psi(epsilon_minus.item())
-
-        x_plus = self.G @ psi_plus
-        x_minus = self.G @ psi_minus
-
-        ES_plus = self.get_CFES2_portfolio_loss(x_plus, alpha)
-        ES_minus = self.get_CFES2_portfolio_loss(x_minus, alpha)
-
-        x = x_plus if ES_plus < ES_minus else x_minus
-
-        w = number_of_shares_to_weights(x, self.option_values)
-
-        return x, w
-
     ###############################################################################################
-    # Numeric optimization helper methods
+    # Numeric optimization
     ###############################################################################################
-
-    def _process_weight_bounds(
-        self,
-        lower_bounds: Optional[Union[np.ndarray, float]],
-        upper_bounds: Optional[Union[np.ndarray, float]],
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Process and validate weight bounds for optimization.
-
-        Parameters
-        ----------
-        lower_bounds : Optional[Union[np.ndarray, float]]
-            Lower bounds for the weights. If None, no lower bound is applied (-inf).
-            Can be a scalar (applied to all options) or an array of shape (M,).
-        upper_bounds : Optional[Union[np.ndarray, float]]
-            Upper bounds for the weights. If None, no upper bound is applied (inf).
-            Can be a scalar (applied to all options) or an array of shape (M,).
-
-        Returns
-        -------
-        Tuple[np.ndarray, np.ndarray]
-            Processed lower and upper bounds arrays of shape (M,).
-
-        Raises
-        ------
-        ValueError
-            If bounds have incorrect length or if lower_bounds > upper_bounds for any element.
-        """
-        if lower_bounds is None:
-            lb = np.full(self.M, -np.inf)
-        elif np.isscalar(lower_bounds):
-            lb = np.full(self.M, lower_bounds)
-        else:
-            lb = np.asarray(lower_bounds).flatten()
-
-        if upper_bounds is None:
-            ub = np.full(self.M, np.inf)
-        elif np.isscalar(upper_bounds):
-            ub = np.full(self.M, upper_bounds)
-        else:
-            ub = np.asarray(upper_bounds).flatten()
-
-        if lb.shape[0] != self.M:
-            raise ValueError(
-                f"lower_bounds must have length {self.M}, got {lb.shape[0]}"
-            )
-        if ub.shape[0] != self.M:
-            raise ValueError(
-                f"upper_bounds must have length {self.M}, got {ub.shape[0]}"
-            )
-        if np.any(lb > ub):
-            raise ValueError("lower_bounds must be <= upper_bounds for all elements")
-
-        return lb, ub
-
-    def _run_weight_optimization(
-        self,
-        objective_fn,
-        lower_bounds: Optional[Union[np.ndarray, float]] = None,
-        upper_bounds: Optional[Union[np.ndarray, float]] = None,
-        warm_start_weights: Optional[list] = None,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Run weight-based optimization with optional box constraints.
-
-        This internal method performs the core optimization loop, minimizing the
-        given objective function over portfolio weights subject to the constraint
-        that weights sum to 1, with optional lower and upper bounds on weights.
-
-        Parameters
-        ----------
-        objective_fn : callable
-            Function that takes weights (np.ndarray of shape (M,)) and returns a scalar.
-        lower_bounds : Optional[Union[np.ndarray, float]], optional
-            Lower bounds for the weights. If None, no lower bound is applied.
-        upper_bounds : Optional[Union[np.ndarray, float]], optional
-            Upper bounds for the weights. If None, no upper bound is applied.
-        warm_start_weights : Optional[list], optional
-            A list of weight vectors (each shape (M,)) to use as additional
-            starting points for the optimizer, in addition to the random
-            Dirichlet starts.  Useful for seeding with analytically-known
-            solutions (e.g., the CFVaR2 Lagrange solution for CFVaR3).
-
-        Returns
-        -------
-        Tuple[np.ndarray, np.ndarray]
-            Contains:
-            - The optimal number of shares for the portfolio
-            - The optimal weights vector
-
-        Raises
-        ------
-        RuntimeError
-            If numerical optimization fails to converge.
-        """
-        v = self.option_values
-
-        # Process bounds
-        lb, ub = self._process_weight_bounds(lower_bounds, upper_bounds)
-        bounds = list(zip(lb, ub))
-
-        # Constraint: weights sum to 1
-        constraints = {"type": "eq", "fun": lambda w: np.sum(w) - 1.0}
-
-        # Use multiple random starts to find the global minimum.
-        # Each start draws an initial weight vector from Dirichlet(1,...,1), which is
-        # the uniform distribution over the M-dimensional probability simplex.  This
-        # gives diverse, properly-normalized starting points (all weights >= 0, sum = 1)
-        # and avoids the solver converging to a local minimum near a single starting
-        # point.  After clipping to the box constraints and re-normalising, each
-        # candidate is used as the initial guess for SLSQP.
-        best_result = None
-        best_objective = float("inf")
-
-        # Collect all starting points: warm starts first, then random Dirichlet
-        starting_points = []
-
-        if warm_start_weights is not None:
-            for ws in warm_start_weights:
-                w0 = np.asarray(ws).flatten()
-                w0 = np.clip(w0, lb, ub)
-                w_sum = np.sum(w0)
-                if abs(w_sum) > OPTIMIZATION_ABS_THRESHOLD:
-                    starting_points.append(w0 / w_sum)
-
-        for _ in range(NUM_RANDOM_STARTS):
-            # Generate initial guess respecting bounds
-            w0 = np.random.dirichlet(np.ones(self.M))
-            w0 = np.clip(w0, lb, ub)
-            # Normalize to satisfy constraint; skip if sum is zero
-            w_sum = np.sum(w0)
-            if abs(w_sum) < OPTIMIZATION_ABS_THRESHOLD:
-                continue
-            starting_points.append(w0 / w_sum)
-
-        for w0 in starting_points:
-            result = minimize(
-                objective_fn,
-                w0,
-                method="SLSQP",
-                constraints=constraints,
-                bounds=bounds,
-                options={"ftol": OPTIMIZATION_FTOL, "maxiter": OPTIMIZATION_MAXITER},
-            )
-            if result.success and result.fun < best_objective:
-                best_objective = result.fun
-                best_result = result
-
-        if best_result is None:
-            raise RuntimeError("Numerical optimization failed to converge")
-
-        w_optimal = best_result.x
-
-        w_optimal = w_optimal.reshape(-1, 1)
-        x_optimal = weights_to_number_of_shares(w_optimal, v)
-        x_optimal = x_optimal.reshape(-1, 1)
-
-        return x_optimal, w_optimal
-
-    def get_optimal_variance_weights_numeric(
-        self,
-        lower_bounds: Optional[Union[np.ndarray, float]] = None,
-        upper_bounds: Optional[Union[np.ndarray, float]] = None,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Get the optimal variance number of shares and weights for
-        the portfolio using numerical optimization.
-
-        Uses scipy.optimize.minimize with SLSQP method to find the
-        weights that minimize the portfolio variance subject to the
-        constraint that weights sum to 1 (i.e., sum(w) = 1).
-
-        Parameters
-        ----------
-        lower_bounds : Optional[Union[np.ndarray, float]], optional
-            Lower bounds for the weights (min percentage per option).
-            If None, no lower bound is applied. Default is None.
-            Can be a scalar (applied to all options) or an array of shape (M,).
-        upper_bounds : Optional[Union[np.ndarray, float]], optional
-            Upper bounds for the weights (max percentage per option).
-            If None, no upper bound is applied. Default is None.
-            Can be a scalar (applied to all options) or an array of shape (M,).
-
-        Returns
-        -------
-        Tuple[np.ndarray, np.ndarray]
-            Contains:
-            - The optimal number of shares for the portfolio
-            - The optimal weights vector scaled by the option values
-        """
-        v = self.option_values
-
-        def objective(w: np.ndarray) -> float:
-            """Objective function: minimize variance."""
-            w_tensor = w.reshape(-1, 1)
-            x_tensor = weights_to_number_of_shares(w_tensor, v)
-            return self.get_variance_portfolio_loss(x_tensor.reshape(-1, 1))
-
-        return self._run_weight_optimization(objective, lower_bounds, upper_bounds)
-
-    def get_optimal_CFVaR2_weights_numeric(
-        self,
-        alpha: float,
-        lower_bounds: Optional[Union[np.ndarray, float]] = None,
-        upper_bounds: Optional[Union[np.ndarray, float]] = None,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Get the optimal CFVaR2 number of shares and weights for
-        the portfolio using numerical optimization.
-
-        Uses scipy.optimize.minimize with SLSQP method to find the
-        weights that minimize the CFVaR2 subject to the constraint
-        that weights sum to 1 (i.e., sum(w) = 1).
-
-        Parameters
-        ----------
-        alpha : float
-            The tail risk for the CFVaR2 calculation.
-        lower_bounds : Optional[Union[np.ndarray, float]], optional
-            Lower bounds for the weights (min percentage per option).
-            If None, no lower bound is applied. Default is None.
-            Can be a scalar (applied to all options) or an array of shape (M,).
-        upper_bounds : Optional[Union[np.ndarray, float]], optional
-            Upper bounds for the weights (max percentage per option).
-            If None, no upper bound is applied. Default is None.
-            Can be a scalar (applied to all options) or an array of shape (M,).
-
-        Returns
-        -------
-        Tuple[np.ndarray, np.ndarray]
-            Contains:
-            - The optimal number of shares for the portfolio
-            - The optimal weights vector scaled by the option values
-        """
-        v = self.option_values
-
-        def objective(w: np.ndarray) -> float:
-            """Objective function: minimize CFVaR2."""
-            w_tensor = w.reshape(-1, 1)
-            x_tensor = weights_to_number_of_shares(w_tensor, v)
-            return self.get_CFVaR2_portfolio_loss(x_tensor.reshape(-1, 1), alpha)
-
-        return self._run_weight_optimization(objective, lower_bounds, upper_bounds)
 
     def get_optimal_CFVaR3_weights_numeric(
-        self,
-        alpha: float,
-        lower_bounds: Optional[Union[np.ndarray, float]] = None,
-        upper_bounds: Optional[Union[np.ndarray, float]] = None,
+        self, alpha: float
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Get the optimal CFVaR3 number of shares and weights for
         the portfolio using numerical optimization.
 
-        Uses scipy.optimize.minimize with SLSQP method to find the
+        Uses scipy.optimize.minimize with the SLSQP method to find the
         weights that minimize the CFVaR3 subject to the constraint
-        that weights sum to 1 (i.e., sum(w) = 1).
+        that weights sum to 1 (i.e., sum(w) = 1).  The optimizer starts
+        from the closed-form CFVaR2 weights, since CFVaR3 = CFVaR2 + third-moment
+        correction and the CFVaR3 optimum is typically near the CFVaR2 optimum.
 
         Parameters
         ----------
         alpha : float
             The tail risk for the CFVaR3 calculation.
-        lower_bounds : Optional[Union[np.ndarray, float]], optional
-            Lower bounds for the weights (min percentage per option).
-            If None, no lower bound is applied. Default is None.
-            Can be a scalar (applied to all options) or an array of shape (M,).
-        upper_bounds : Optional[Union[np.ndarray, float]], optional
-            Upper bounds for the weights (max percentage per option).
-            If None, no upper bound is applied. Default is None.
-            Can be a scalar (applied to all options) or an array of shape (M,).
 
         Returns
         -------
@@ -764,6 +347,13 @@ class OptionPortfolio:
             Contains:
             - The optimal number of shares for the portfolio
             - The optimal weights vector scaled by the option values
+
+        Raises
+        ------
+        ValueError
+            If the degrees of freedom are not above 6, the condition for the third moment.
+        RuntimeError
+            If the optimization does not converge.
         """
         v = self.option_values
 
@@ -775,407 +365,22 @@ class OptionPortfolio:
 
         def objective(w: np.ndarray) -> float:
             """Objective function: minimize CFVaR3."""
-            w_tensor = w.reshape(-1, 1)
-            x_tensor = weights_to_number_of_shares(w_tensor, v)
+            x_tensor = weights_to_number_of_shares(w.reshape(-1, 1), v)
             return self.get_CFVaR3_portfolio_loss(x_tensor.reshape(-1, 1), alpha)
 
-        # Seed the optimizer with the analytical CFVaR2 Lagrange solution,
-        # since CFVaR3 = CFVaR2 + third-moment correction and the CFVaR3
-        # optimum is typically near the CFVaR2 optimum.
         _, w_cfvar2 = self.get_optimal_CFVaR2_weights_lagrange(alpha)
-        warm_starts = [w_cfvar2.flatten()]
-
-        return self._run_weight_optimization(
-            objective, lower_bounds, upper_bounds, warm_start_weights=warm_starts
+        result = minimize(
+            objective,
+            w_cfvar2.flatten(),
+            method="SLSQP",
+            constraints={"type": "eq", "fun": lambda w: np.sum(w) - 1.0},
+            options={"ftol": OPTIMIZATION_FTOL, "maxiter": OPTIMIZATION_MAXITER},
         )
-
-    def get_optimal_CFES2_weights_numeric(
-        self,
-        alpha: float,
-        lower_bounds: Optional[Union[np.ndarray, float]] = None,
-        upper_bounds: Optional[Union[np.ndarray, float]] = None,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Get the optimal CFES2 number of shares and weights for
-        the portfolio using numerical optimization.
-
-        Uses scipy.optimize.minimize with SLSQP method to find the
-        weights that minimize the CFES2 subject to the constraint
-        that weights sum to 1 (i.e., sum(w) = 1).
-
-        Parameters
-        ----------
-        alpha : float
-            The tail risk for the CFES2 calculation.
-        lower_bounds : Optional[Union[np.ndarray, float]], optional
-            Lower bounds for the weights (min percentage per option).
-            If None, no lower bound is applied. Default is None.
-            Can be a scalar (applied to all options) or an array of shape (M,).
-        upper_bounds : Optional[Union[np.ndarray, float]], optional
-            Upper bounds for the weights (max percentage per option).
-            If None, no upper bound is applied. Default is None.
-            Can be a scalar (applied to all options) or an array of shape (M,).
-
-        Returns
-        -------
-        Tuple[np.ndarray, np.ndarray]
-            Contains:
-            - The optimal number of shares for the portfolio
-            - The optimal weights vector scaled by the option values
-        """
-        v = self.option_values
-
-        def objective(w: np.ndarray) -> float:
-            """Objective function: minimize CFES2."""
-            w_tensor = w.reshape(-1, 1)
-            x_tensor = weights_to_number_of_shares(w_tensor, v)
-            return self.get_CFES2_portfolio_loss(x_tensor.reshape(-1, 1), alpha)
-
-        return self._run_weight_optimization(objective, lower_bounds, upper_bounds)
-
-    def get_optimal_CFES3_weights_numeric(
-        self,
-        alpha: float,
-        lower_bounds: Optional[Union[np.ndarray, float]] = None,
-        upper_bounds: Optional[Union[np.ndarray, float]] = None,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Get the optimal CFES3 number of shares and weights for
-        the portfolio using numerical optimization.
-
-        Uses scipy.optimize.minimize with SLSQP method to find the
-        weights that minimize the CFES3 subject to the constraint
-        that weights sum to 1 (i.e., sum(w) = 1).
-
-        Parameters
-        ----------
-        alpha : float
-            The tail risk for the CFES3 calculation.
-        lower_bounds : Optional[Union[np.ndarray, float]], optional
-            Lower bounds for the weights (min percentage per option).
-            If None, no lower bound is applied. Default is None.
-            Can be a scalar (applied to all options) or an array of shape (M,).
-        upper_bounds : Optional[Union[np.ndarray, float]], optional
-            Upper bounds for the weights (max percentage per option).
-            If None, no upper bound is applied. Default is None.
-            Can be a scalar (applied to all options) or an array of shape (M,).
-
-        Returns
-        -------
-        Tuple[np.ndarray, np.ndarray]
-            Contains:
-            - The optimal number of shares for the portfolio
-            - The optimal weights vector scaled by the option values
-        """
-        v = self.option_values
-
-        if self.degrees_of_freedom <= 6:
-            raise ValueError(
-                "Degrees of freedom must be greater than 6 for the third moment to exist, "
-                "which is required for CFES3 optimization."
-            )
-
-        def objective(w: np.ndarray) -> float:
-            """Objective function: minimize CFES3."""
-            w_tensor = w.reshape(-1, 1)
-            x_tensor = weights_to_number_of_shares(w_tensor, v)
-            return self.get_CFES3_portfolio_loss(x_tensor.reshape(-1, 1), alpha)
-
-        return self._run_weight_optimization(objective, lower_bounds, upper_bounds)
-
-    ###############################################################################################
-    # Sharpe Ratio optimization methods
-    ###############################################################################################
-
-    def get_sharpe_ratio(
-        self,
-        shares_vector: np.ndarray,
-        annual_risk_free_rate: float,
-    ) -> float:
-        """
-        Compute the Sharpe ratio of the portfolio.
-        The Sharpe ratio is defined as:
-        SR = (E[\\Delta V(x)] - r_f * \\Delta t) / sqrt(Var[\\Delta V(x)])
-        where E[\\Delta V(x)] is the expected portfolio return (negative of expected loss),
-        r_f * \\Delta t is the risk-free rate over the time period, and
-        Var[\\Delta V(x)] is the portfolio variance.
-
-        Parameters
-        ----------
-        shares_vector : np.ndarray
-            The vector of number of shares of the options in the portfolio.
-        annual_risk_free_rate : float
-            The annualized risk-free interest rate. It will be scaled by
-            time_period_for_risk_measurements (\\Delta t) internally.
-
-        Returns
-        -------
-        float
-            The Sharpe ratio of the portfolio
-        """
-        shares_vector = np.asarray(shares_vector, dtype=float)
-
-        expected_return = self.get_expected_portfolio_gain(shares_vector)
-
-        variance = self.get_variance_portfolio_loss(shares_vector)
-        std_dev = np.sqrt(variance)
-
-        risk_free_rate_period = (
-            annual_risk_free_rate * self.time_period_for_risk_measurements
-        )
-        sharpe_ratio = (expected_return - risk_free_rate_period) / std_dev
-
-        return float(sharpe_ratio)
-
-    def get_optimal_sharpe_ratio_weights_lagrange(
-        self,
-        annual_risk_free_rate: float,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Get the optimal weights for maximum Sharpe ratio using analytical solution.
-        The analytical solution is:
-        x = U^{-1}(zeta - r_f * \\Delta t * v) / (v^T @ U^{-1} @ (zeta - r_f * \\Delta t * v))
-        where U is the variance matrix with drift, zeta is the expected loss vector with drift,
-        v is the option values vector, and r_f * \\Delta t is the risk-free rate over the period.
-
-        Parameters
-        ----------
-        annual_risk_free_rate : float
-            The annualized risk-free interest rate. It will be scaled by
-            time_period_for_risk_measurements (\\Delta t) internally.
-
-        Returns
-        -------
-        np.ndarray
-            The optimal number of shares for maximum Sharpe ratio
-        np.ndarray
-            The weights vector scaled by the option values
-        """
-        v = self.option_values
-        u = self.u
-        Q_inv = self.Q_inv
-
-        # Compute u - r_f * v
-        risk_free_rate_period = (
-            annual_risk_free_rate * self.time_period_for_risk_measurements
-        )
-        u_minus_rf_v = u - risk_free_rate_period * v
-
-        # Compute Q^{-1} @ (u - r_f * v)
-        numerator = Q_inv @ u_minus_rf_v
-
-        # Compute v^T @ Q^{-1} @ (u - r_f * v)
-        denominator = v.T @ numerator
-
-        x = numerator / denominator
-        weights = number_of_shares_to_weights(x, v)
-
-        return x, weights
-
-    def get_optimal_sharpe_ratio_weights_numeric(
-        self,
-        annual_risk_free_rate: float,
-        lower_bounds: Optional[Union[float, np.ndarray]] = 0.0,
-        upper_bounds: Optional[Union[float, np.ndarray]] = None,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Get the optimal weights for maximum Sharpe ratio using numerical optimization.
-        Note: We maximize the Sharpe ratio (not minimize), so we negate the objective function.
-
-        Parameters
-        ----------
-        annual_risk_free_rate : float
-            The annualized risk-free interest rate. It will be scaled by
-            time_period_for_risk_measurements (\\Delta t) internally.
-        lower_bounds : Optional[Union[float, np.ndarray]], optional
-            Lower bounds for the weights. Defaults to 0.0 (no short selling).
-        upper_bounds : Optional[Union[float, np.ndarray]], optional
-            Upper bounds for the weights. Defaults to None (no upper bound).
-
-        Returns
-        -------
-        np.ndarray
-            The optimal number of shares for maximum Sharpe ratio
-        np.ndarray
-            The weights vector scaled by the option values
-        """
-        v = self.option_values
-
-        def objective(w: np.ndarray) -> float:
-            """
-            Objective function: maximize Sharpe ratio (minimize negative Sharpe ratio).
-
-            Parameters
-            ----------
-            w : np.ndarray
-                Weights vector of shape (M,)
-
-            Returns
-            -------
-            float
-                Negative Sharpe ratio to be minimized
-            """
-            w_tensor = w.reshape(-1, 1)
-            x_tensor = weights_to_number_of_shares(w_tensor, v)
-            sharpe_ratio = self.get_sharpe_ratio(
-                x_tensor.reshape(-1, 1), annual_risk_free_rate
-            )
-            # Return negative because we want to maximize Sharpe ratio
-            return -sharpe_ratio
-
-        return self._run_weight_optimization(objective, lower_bounds, upper_bounds)
-
-    def get_returnVaR_ratio(
-        self, shares_vector: np.ndarray, alpha: float, annual_risk_free_rate: float
-    ) -> float:
-        """
-        Compute the return-to-VaR ratio of the portfolio.
-
-        Parameters
-        ----------
-        shares_vector : np.ndarray
-            The vector of number of shares of the options in the portfolio.
-        alpha : float
-            The tail risk for the CFVaR2 calculation.
-        annual_risk_free_rate : float
-            The annualized risk-free interest rate. It will be scaled by
-            time_period_for_risk_measurements (\\Delta t) internally.
-
-        Returns
-        -------
-        float
-            The return-to-VaR ratio of the portfolio
-        """
-        shares_vector = np.asarray(shares_vector, dtype=float)
-
-        expected_return = -self.get_expected_portfolio_loss(shares_vector)
-
-        cfvar2 = self.get_CFVaR2_portfolio_loss(shares_vector, alpha=alpha)
-
-        risk_free_rate_period = (
-            annual_risk_free_rate * self.time_period_for_risk_measurements
-        )
-        returnVaR_ratio = (expected_return - risk_free_rate_period) / cfvar2
-
-        return float(returnVaR_ratio)
-
-    def get_optimal_returnVaR_ratio_lagrange(
-        self, alpha: float, annual_risk_free_rate: float
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Get the optimal weights for maximum return-to-VAR ratio using analytical solution.
-
-        Parameters
-        ----------
-        alpha : float
-            The tail risk for the CFVaR2 calculation.
-        annual_risk_free_rate : float
-            The annualized risk-free interest rate. It will be scaled by
-            time_period_for_risk_measurements (\\Delta t) internally.
-
-        Returns
-        -------
-        np.ndarray
-            The optimal number of shares for maximum return-to-VAR ratio
-        np.ndarray
-            The weights vector scaled by the option values
-        """
-        v = self.option_values
-        Q_inv = self.Q_inv
-        u = self.u
-
-        alpha = alpha
-        r = annual_risk_free_rate * self.time_period_for_risk_measurements
-
-        A_var_sharpe = u.T @ Q_inv @ u - norm.ppf(alpha) ** 2 / 2
-        B_var_sharpe = 2 * r * u.T @ Q_inv @ v - 2 * u.T @ Q_inv @ u
-        C_var_sharpe = (
-            u.T @ Q_inv @ u - 2 * r * u.T @ Q_inv @ v + r**2 * v.T @ Q_inv @ v
-        )
-
-        discriminant = B_var_sharpe**2 - 4 * A_var_sharpe * C_var_sharpe
-        discriminant = float(discriminant)
-
-        if discriminant < 0 and abs(discriminant) < OPTIMIZATION_ABS_THRESHOLD:
-            discriminant = 0.0
-
-        lambda_plus = (-B_var_sharpe + np.sqrt(discriminant)) / (2 * A_var_sharpe)
-
-        lambda_minus = (-B_var_sharpe - np.sqrt(discriminant)) / (2 * A_var_sharpe)
-
-        numerator_plus = Q_inv @ ((1 - lambda_plus) * u - r * v)
-        denominator_plus = v.T @ numerator_plus
-        x_plus = numerator_plus / denominator_plus
-
-        numerator_minus = Q_inv @ ((1 - lambda_minus) * u - r * v)
-        denominator_minus = v.T @ numerator_minus
-        x_minus = numerator_minus / denominator_minus
-
-        returnVaR_plus = self.get_returnVaR_ratio(x_plus, alpha, annual_risk_free_rate)
-        returnVaR_minus = self.get_returnVaR_ratio(
-            x_minus, alpha, annual_risk_free_rate
-        )
-
-        x = x_plus if returnVaR_plus > returnVaR_minus else x_minus
-        weights = number_of_shares_to_weights(x, v)
-
-        return x, weights
-
-    def get_optimal_returnVaR_ratio_numeric(
-        self,
-        alpha: float,
-        annual_risk_free_rate: float,
-        lower_bounds: Optional[Union[float, np.ndarray]] = 0.0,
-        upper_bounds: Optional[Union[float, np.ndarray]] = None,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Get the optimal weights for maximum return-to-VaR ratio using numerical optimization.
-        Note: We maximize the return-to-VaR ratio (not minimize), so we negate the objective function.
-
-        Parameters
-        ----------
-        alpha : float
-            The tail risk for the CFVaR2 calculation.
-        annual_risk_free_rate : float
-            The annualized risk-free interest rate. It will be scaled by
-            time_period_for_risk_measurements (\\Delta t) internally.
-        lower_bounds : Optional[Union[float, np.ndarray]], optional
-            Lower bounds for the weights. Defaults to 0.0 (no short selling).
-        upper_bounds : Optional[Union[float, np.ndarray]], optional
-            Upper bounds for the weights. Defaults to None (no upper bound).
-
-        Returns
-        -------
-        np.ndarray
-            The optimal number of shares for maximum return-to-VaR ratio
-        np.ndarray
-            The weights vector scaled by the option values
-        """
-        v = self.option_values
-
-        def objective(w: np.ndarray) -> float:
-            """
-            Objective function: maximize return-to-VaR ratio (minimize negative return-to-VaR ratio).
-
-            Parameters
-            ----------
-            w : np.ndarray
-                Weights vector of shape (M,)
-
-            Returns
-            -------
-            float
-                Negative return-to-VaR ratio to be minimized
-            """
-            w_tensor = w.reshape(-1, 1)
-            x_tensor = weights_to_number_of_shares(w_tensor, v)
-            returnVaR_ratio = self.get_returnVaR_ratio(
-                x_tensor.reshape(-1, 1), alpha, annual_risk_free_rate
-            )
-            # Return negative because we want to maximize return-to-VaR ratio
-            return -returnVaR_ratio
-
-        return self._run_weight_optimization(objective, lower_bounds, upper_bounds)
+        if not result.success:
+            raise RuntimeError("Numerical optimization failed to converge")
+
+        w_optimal = result.x.reshape(-1, 1)
+        return weights_to_number_of_shares(w_optimal, v).reshape(-1, 1), w_optimal
 
     ###############################################################################################
     # Helper functions to compute components of variance and CFVaR2
@@ -1448,20 +653,6 @@ class OptionPortfolio:
         return U
 
     @cached_property
-    def U_inv(self) -> np.ndarray:
-        """
-        Compute the inverse of the matrix U which is the variance of the portfolio loss.
-
-        Returns
-        -------
-        np.ndarray
-            The inverse of the matrix U representing the variance of the portfolio loss.
-        """
-        U = self.U
-        U_inv = invert_matrix_with_regularization(U, "Variance quadratic form matrix U")
-        return U_inv
-
-    @cached_property
     def D(self) -> np.ndarray:
         """
         Compute the D matrix used in variance and CFVaR2 calculations.
@@ -1525,29 +716,6 @@ class OptionPortfolio:
             idx = self.underlying_map[option.underlying.name]
             G[m, idx] = option.gamma
         return G
-
-    @cached_property
-    def gamma_matrix(self) -> np.ndarray:
-        """
-        Compute the Gamma matrix used in variance and CFVaR2 calculations.
-
-        Returns
-        -------
-        np.ndarray
-            The Gamma matrix
-
-        Formula
-        -------
-        $\\coloneq [\\gamma_{i,j}]_{i=1,\\ldots,N}^{j=1,\\ldots,N} \\in \\R^{N\times N}, \\qquad \\displaystyle
-        \\gamma_{i,j} \\coloneq \\pdv{V (\\x; \\S,t)}{S_i,S_j}$
-        """
-        Gamma_matrix = np.zeros((self.N, self.N))
-
-        for _, option in enumerate(self.options):
-            underlying_index = self.underlying_map[option.underlying.name]
-            Gamma_matrix[underlying_index, underlying_index] += option.gamma
-
-        return Gamma_matrix
 
     @cached_property
     def J(self) -> np.ndarray:
@@ -1869,9 +1037,7 @@ class OptionPortfolio:
         np.ndarray
             $Q^{-1}$
         """
-        return invert_matrix_with_regularization(
-            self.Q, "Unified variance quadratic form matrix Q"
-        )
+        return np.linalg.inv(self.Q)
 
     def psi(self, epsilon: float) -> np.ndarray:
         """
@@ -1938,7 +1104,7 @@ class OptionPortfolio:
 
         J_Q_inv_J_T = J @ Q_inv @ J.T
 
-        J_Q_inv_J_T_inv = invert_matrix_with_regularization(J_Q_inv_J_T)
+        J_Q_inv_J_T_inv = np.linalg.inv(J_Q_inv_J_T)
 
         return J_Q_inv_J_T_inv
 
@@ -2138,83 +1304,3 @@ class OptionPortfolio:
         C_script = self.C_script
         C_cal = B_script**2 * norm.ppf(alpha) ** 2 - 4 * C_script
         return C_cal
-
-    def A_cal_ES(self, alpha: float) -> np.ndarray:
-        """
-        Coefficient for epsilon^2 in the quadratic equation for CFES2 optimization.
-
-        Parameters
-        ----------
-        alpha : float
-            The tail risk for the CFES2 calculation.
-
-        Returns
-        -------
-        np.ndarray
-            The coefficient $\\hat{\\mathcal{A}}$ in the quadratic equation.
-
-        Formula
-        -------
-        $\\hat{\\mathcal{A}} \\coloneq  4\\mathscr{A}^2
-        \\left(\\dfrac{\\varphi(\\normal^{-1}(\\alpha))}{\\alpha}\\right)^2 - 4\\mathscr{A}$
-        """
-        A_script = self.A_script
-        z_alpha = norm.ppf(alpha)
-        phi_over_alpha = norm.pdf(z_alpha) / alpha
-
-        A_cal_ES = 4 * (A_script**2) * phi_over_alpha**2 - 4 * A_script
-        return A_cal_ES
-
-    def B_cal_ES(self, alpha: float) -> np.ndarray:
-        """
-        Coefficient for epsilon in the quadratic equation for CFES2 optimization.
-
-        Parameters
-        ----------
-        alpha : float
-            The tail risk for the CFES2 calculation.
-
-        Returns
-        -------
-        np.ndarray
-            The coefficient $\\hat{\\mathcal{B}}$ in the quadratic equation.
-
-        Formula
-        -------
-        $\\hat{\\mathcal{B}} \\coloneq  4\\mathscr{A}\\mathscr{B}
-        \\left(\\dfrac{\\varphi(\\normal^{-1}(\\alpha))}{\\alpha}\\right)^2 - 4\\mathscr{B}$
-        """
-        A_script = self.A_script
-        B_script = self.B_script
-        z_alpha = norm.ppf(alpha)
-        phi_over_alpha = norm.pdf(z_alpha) / alpha
-
-        B_cal_ES = 4 * A_script * B_script * phi_over_alpha**2 - 4 * B_script
-        return B_cal_ES
-
-    def C_cal_ES(self, alpha: float) -> np.ndarray:
-        """
-        Constant in the quadratic equation for CFES2 optimization.
-
-        Parameters
-        ----------
-        alpha : float
-            The tail risk for the CFES2 calculation.
-
-        Returns
-        -------
-        np.ndarray
-            The constant term $\\hat{\\mathcal{C}}$ in the quadratic equation.
-
-        Formula
-        -------
-        $\\hat{\\mathcal{C}} \\coloneq \\mathscr{B}^2
-        \\left(\\dfrac{\\varphi(\\normal^{-1}(\\alpha))}{\\alpha}\\right)^2 - 4\\mathscr{C}$
-        """
-        B_script = self.B_script
-        C_script = self.C_script
-        z_alpha = norm.ppf(alpha)
-        phi_over_alpha = norm.pdf(z_alpha) / alpha
-
-        C_cal_ES = B_script**2 * phi_over_alpha**2 - 4 * C_script
-        return C_cal_ES

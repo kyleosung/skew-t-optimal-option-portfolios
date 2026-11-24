@@ -46,7 +46,7 @@ dp_dist <- list(
   nu    = dp$nu
 )
 
-cp <- dp2cp(dp_dist, family = "ST")
+cp <- if (ncol(Y) > 1) dp2cp(dp_dist, family = "ST") else NULL
 
 # Adjust log-likelihood back to original Y scale
 n <- nrow(Y)
@@ -56,13 +56,15 @@ logL <- fit_s$logL + n * p * log(s)
 # Project notation:
 # mu    = location vector
 # Sigma = scale matrix
-# omega = skewness vector (alpha is reserved elsewhere for tail risk)
+# alpha = shape vector (R's dp$alpha); not the tail-risk level
+# omega = skewness vector, omega = diag(Sigma)^(-1/2) alpha
 # nu    = degrees of freedom
 out <- list(
   dp = list(
     mu    = as.vector(dp$beta),
-    Sigma = dp$Omega,
-    omega = dp$alpha,
+    Sigma = as.matrix(dp$Omega),
+    alpha = dp$alpha,
+    omega = dp$alpha / sqrt(diag(as.matrix(dp$Omega))),
     nu    = dp$nu
   ),
   cp = cp,
